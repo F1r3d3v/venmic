@@ -130,6 +130,13 @@ target_link_libraries(${PROJECT_NAME} PUBLIC cr::rohrkabel tl::expected cr::chan
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # --------------------------------------------------------------------------------------------------------
+# Link PipeWire
+# --------------------------------------------------------------------------------------------------------
+
+find_package(PipeWire REQUIRED)
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${PIPEWIRE_INCLUDE_DIRS} ${SPA_INCLUDE_DIRS})
+
+# --------------------------------------------------------------------------------------------------------
 # Link PulseAudio
 # --------------------------------------------------------------------------------------------------------
 

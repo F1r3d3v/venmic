@@ -11,6 +11,7 @@
 
 #include <glaze/glaze.hpp>
 #include <rohrkabel/device/device.hpp>
+#include <pipewire/pipewire.h>
 
 namespace vencord
 {
@@ -76,7 +77,7 @@ namespace vencord
         throw std::runtime_error("Failed to create patchbay instance");
     }
 
-    port_map patchbay::impl::map_ports(const node_with_ports &target)
+    port_map patchbay::impl::map_ports(const node_with_ports &input, const node_with_ports &output)
     {
         port_map rtn;
 
@@ -89,26 +90,25 @@ namespace vencord
             return item.direction == pw::port_direction::input;
         };
 
-        const auto mic  = nodes[virt_mic->id()];
-        auto mic_inputs = mic.ports | ranges::views::filter(is_input);
+        auto inputs = input.ports | ranges::views::filter(is_input);
 
-        const auto id             = target.info.id;
-        const auto target_outputs = target.ports | ranges::views::filter(is_output) | ranges::to<std::vector>;
+        const auto id      = output.info.id;
+        const auto outputs = output.ports | ranges::views::filter(is_output) | ranges::to<std::vector>;
 
-        if (target_outputs.empty())
+        if (outputs.empty())
         {
             logger::get()->warn("[patchbay] (map_ports) {} has no ports", id);
             return rtn;
         }
 
-        const auto is_mono = target_outputs.size() == 1;
+        const auto is_mono = outputs.size() == 1;
 
         if (is_mono)
         {
             logger::get()->debug("[patchbay] (map_ports) {} is mono", id);
         }
 
-        for (const auto &port : target_outputs)
+        for (const auto &port : outputs)
         {
             auto port_props = port.props;
 
@@ -130,7 +130,7 @@ namespace vencord
             };
 
             auto mapping =
-                mic_inputs                                                                                          //
+                inputs                                                                                          //
                 | ranges::views::filter(matching_channel)                                                           //
                 | ranges::views::transform([port](const auto &mic_port) { return std::make_pair(mic_port, port); }) //
                 | ranges::to<std::vector>;
@@ -148,7 +148,7 @@ namespace vencord
         logger::get()->trace("[patchbay] (create_mic) creating virt-mic");
 
         auto node = core->create<pw::node>(pw::null_sink_factory{
-                                               .name      = "vencord-screen-share",
+                                               .name      = "screen-share-sink",
                                                .positions = {"FL", "FR"},
                                            })
                         .get();
@@ -185,12 +185,12 @@ namespace vencord
     {
         cleanup(false);
 
-        for (const auto &[id, info] : nodes)
+        for (const auto &id: nodes | std::views::keys)
         {
             on_node(id);
         }
 
-        for (const auto &[id, info] : links)
+        for (const auto &id: links | std::views::keys)
         {
             on_link(id);
         }
@@ -230,7 +230,8 @@ namespace vencord
 
         logger::get()->debug("[patchbay] (link) linking {}", id);
 
-        auto mapping = map_ports(target);
+        const auto &mic_node = nodes[mic_id];
+        auto mapping = map_ports(mic_node, target);
 
         for (auto [it, end] = created.equal_range(id); it != end; ++it)
         {
@@ -265,6 +266,141 @@ namespace vencord
         }
 
         logger::get()->debug("[patchbay] (link) linked all ports of {}", id);
+    }
+
+    void patchbay::impl::remove_link(const std::uint32_t output, const std::uint32_t input) {
+
+        if (!nodes.contains(output) || !nodes.contains(input)) {
+            logger::get()->warn("[patchbay] (remove_links) called with bad nodes: {} -> {}", output, input);
+            return;
+        }
+
+        auto linksToRemove = std::vector<std::uint32_t>{};
+        for (auto &[link_id, link_info] : links) {
+            if (link_info.output.node == output && link_info.input.node == input) {
+                logger::get()->debug("[patchbay] (remove_links) marking link {} for removal ({} -> {})",
+                                     link_id, link_info.output.node, link_info.input.node);
+                linksToRemove.push_back(link_info.id);
+            }
+        }
+
+        if (!linksToRemove.empty()) {
+            std::ranges::for_each(linksToRemove, [this](const auto &link_id) {
+                pw_registry_destroy(registry->get(), link_id);
+                logger::get()->debug("[patchbay] (remove_links) removed link {}", link_id);
+            });
+        } else {
+            logger::get()->debug("[patchbay] (remove_links) no links found from {} to {}", output, input);
+        }
+    }
+
+    void patchbay::impl::connect_to(const std::uint32_t id) {
+        if (!virt_mic) {
+            return;
+        }
+
+        const auto mic_id = virt_mic->id();
+
+        if (id == mic_id)
+        {
+            logger::get()->warn("[patchbay] (connect_to) prevented connection to self");
+            return;
+        }
+
+        if (!nodes.contains(id))
+        {
+            logger::get()->warn("[patchbay] (connect_to) called with bad node: {}", id);
+            return;
+        }
+
+        const auto &mic_node = nodes[mic_id];
+        const auto &node = nodes[id];
+
+        auto mapping = map_ports(node, mic_node);
+
+        for (auto [it, end] = created.equal_range(id); it != end; ++it)
+        {
+            auto equal = [info = it->second.info()](const auto &map)
+            {
+                return map.first.id == info.input.port && map.second.id == info.output.port;
+            };
+
+            std::erase_if(mapping, equal);
+        }
+
+        for (auto &[input, output]: mapping) {
+            auto link_result = core->create<pw::link>(pw::link_factory{
+                input.id,
+                output.id,
+            }).get();
+
+            if (!link_result.has_value()) {
+                logger::get()->warn("[patchbay] (connect_to) failed to create link from {} to {}: {}",
+                                    output.id, input.id, link_result.error().message);
+                return;
+            }
+            logger::get()->debug("[patchbay] (connect_to) created link {}: {} (node) -> {} (mic) (channel: {})",
+                                 link_result->id(), output.id, input.id, input.props["audio.channel"]);
+
+            created.emplace(id, std::move(*link_result));
+        }
+
+        logger::get()->debug("[patchbay] (connect_to) connected all ports of mic to {}", id);
+    }
+
+    void patchbay::impl::reroute() {
+        if (!virt_mic) {
+            return;
+        }
+
+        const auto mic_id = virt_mic->id();
+        logger::get()->debug("[patchbay] (reroute) rerouting discord to {}", mic_id);
+
+        const auto isWebRTC = [](const auto &item) {
+            const auto &props = item.second.info.props;
+            return props.contains("node.name") && props.at("node.name") == "WEBRTC VoiceEngine" &&
+                   props.contains("application.process.binary") && props.at("application.process.binary") == "Discord" &&
+                   props.contains("media.name") && props.at("media.name") == "playStream";
+        };
+
+        const auto isDiscordCapture = [](const auto &item) {
+            const auto &props = item.second.info.props;
+            return props.contains("node.name") && props.at("node.name") == "discord_capture";
+        };
+
+        auto webrtcNode = ranges::find_if(nodes, isWebRTC);
+        auto discordCaptureNode = ranges::find_if(nodes, isDiscordCapture);
+
+        if (webrtcNode == nodes.end() || discordCaptureNode == nodes.end()) {
+            logger::get()->warn("[patchbay] (reroute) no discord node found, skipping");
+            return;
+        }
+
+        const auto webrtc_id = webrtcNode->first;
+        const auto capture_id = discordCaptureNode->first;
+
+        logger::get()->debug("[patchbay] (reroute) found WebRTC node: {}, capture node: {}", webrtc_id,
+                             capture_id);
+
+        core->update();
+
+        remove_link(webrtc_id, capture_id);
+        connect_to(capture_id);
+
+        auto nodesToRemove = nodes
+                             | ranges::views::filter(isDiscordCapture)
+                             | ranges::view::keys
+                             | ranges::views::remove_if([&](auto &node) {
+                                 return node == capture_id;
+                             })
+                             | ranges::to<std::vector>;
+
+        ranges::for_each(nodesToRemove, [&](auto &node) {
+            pw_registry_destroy(registry->get(), node);
+            logger::get()->debug("[patchbay] (remove_nodes) removed node {}", node);
+        });
+
+        logger::get()->debug("[patchbay] (reroute) discord rerouting completed");
     }
 
     void patchbay::impl::meta_update(std::string_view key, pw::metadata_property prop)
@@ -521,6 +657,7 @@ namespace vencord
         if (global.type == pw::node::type)
         {
             bind<pw::node>(global);
+            reroute();
         }
         else if (global.type == pw::metadata::type)
         {
@@ -533,6 +670,7 @@ namespace vencord
         else if (global.type == pw::link::type)
         {
             bind<pw::link>(global);
+            reroute();
         }
     }
 

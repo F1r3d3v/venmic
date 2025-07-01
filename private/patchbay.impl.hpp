@@ -110,7 +110,7 @@ namespace vencord
         impl();
 
       private:
-        [[nodiscard]] port_map map_ports(const node_with_ports &);
+        [[nodiscard]] port_map map_ports(const node_with_ports &, const node_with_ports &);
 
       private:
         void create_mic();
@@ -121,6 +121,11 @@ namespace vencord
 
       private:
         void link(std::uint32_t);
+        void connect_to(std::uint32_t);
+        void remove_link(std::uint32_t, std::uint32_t);
+
+      private:
+        void reroute();
 
       private:
         void meta_update(std::string_view, pw::metadata_property);
