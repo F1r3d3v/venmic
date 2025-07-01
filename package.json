@@ -18,7 +18,7 @@
     "clean": "cmake-js clean",
     "test": "node tests/node/*.js",
     "cpcmds": "cmake-js configure --CDvenmic_addon=ON --CDCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-    "install": "pkg-prebuilds-verify ./lib/options.js || cmake-js compile --CDvenmic_addon=ON"
+    "build": "pkg-prebuilds-verify ./lib/options.js || cmake-js compile --CDvenmic_addon=ON"
   },
   "os": [
     "linux"
